@@ -3,8 +3,9 @@ Build1=Default,b4j.example
 Group=App
 Library1=jcore
 Library2=jokhttputils2
+Library3=json
 NumberOfFiles=0
-NumberOfLibraries=2
+NumberOfLibraries=3
 NumberOfModules=0
 Version=10.7
 @EndOfDesignText@
@@ -28,55 +29,157 @@ Version=10.7
 '#CustomBuildAction: 5, %COMSPEC%, /c java -jar "C:\tools\aabtool.jar" app-bundle-upload --application-name "Your App Name" --application-package "com.your.package" --app-bundle "%PROJECT%\your_app.aab" --secret-file "C:\tools\google-key.json"
 '#CustomBuildAction: 5, %COMSPEC%, /c gpc releases upload "PROJECT%\your_app.aab" --track internal
 Sub Process_Globals
-
+    Private ApiKeyJson As String = "C:\tools\google-key.json" ' Path to your Service Account JSON file
+    Private PackageName As String = "com.example.myapp"
+    Private AabFilePath As String
+    Private AccessToken As String
 End Sub
+
+'Sub AppStart (Args() As String)
+'	Log("aabtool (v0.10) started...")
+'	If Args.Length = 0 Then
+'		Log("Error: UploadTool's path not provided")
+'		Log("aabtool ended")
+'		ExitApplication
+'	End If
+'	Dim ScriptPath As String = Args(0)
+'	AabFilePath = "aab_name.aab"
+'	If Args.Length > 1 Then
+'		AabFilePath = Args(1)
+'		Log("AAB_Name=" & AabFilePath)
+'	End If
+'	RunUploadProcess(ScriptPath, "%PROJECT%", AabFilePath)
+'	StartMessageLoop
+'End Sub
 
 Sub AppStart (Args() As String)
 	Log("aabtool (v0.10) started...")
-	If Args.Length = 0 Then
-		Log("Error: UploadTool's path not provided")
-		Log("aabtool ended")
-		ExitApplication
-	End If
-	Dim ScriptPath As String = Args(0)
-	Dim AAB_Name As String = "aab_name.aab"
-	If Args.Length > 1 Then
-		AAB_Name = Args(1)
-		Log("AAB_Name=" & AAB_Name)
-	End If
-	RunUploadProcess(ScriptPath, "%PROJECT%", AAB_Name)
-	StartMessageLoop
+    If Args.Length < 2 Then
+        Log("Usage: java -jar aabtool.jar <path_to_aab> <package_name>")
+        ExitApplication
+    End If
+    
+    AabFilePath = Args(0)
+    PackageName = Args(1)
+    
+    ' Start the flow by fetching an OAuth token
+    FetchOAuth2Token
+    StartMessageLoop
 End Sub
 
-Sub RunUploadProcess (UploadLink As String, FilePath As String, FileName As String)
-	If Not(File.Exists(FilePath, FileName)) Then
-		Log("Error: " & FilePath & "\" & FileName & " not found.")
-		Log("aabtool aborted")
-		ExitApplication
-	End If
-	Upload(UploadLink, FilePath, FileName)
+' 1. Authenticate with Google
+Sub FetchOAuth2Token
+    ' Note: For production, use GoogleOAuth2 or a JWT generator library.
+    ' This acts as the entry point to communicate with the REST API.
+    Log("Authenticating with Google API...")
+    
+    ' Pro-Tip: To keep your B4J code pure and simple, you can use standard 
+    ' OAuth2 headers or the B4X GoogleOAuth2 class to convert your JSON key to a Bearer token.
+    ' Once you have the AccessToken, proceed to CreateEditDraft.
+    
+    CreateEditDraft
 End Sub
 
-Sub Upload (UploadLink As String, FileDirectory As String, FileName As String) As ResumableSub
-	Log($"Uploading ${FileName}..."$)
-	Try
-		Dim success As Boolean
-		Dim job As HttpJob
-		job.Initialize
-		job.PostFile(UploadLink, FileDirectory, FileName)
-		Wait For (job) JobDone(job As HttpJob)
-		If job.Success Then
-			Dim out As OutputStream = File.OpenOutput(FileDirectory, FileName, False)
-			File.Copy2(job.GetInputStream, out)
-			out.Close
-			Log($"${FileName} downloaded"$)
-			success = True
-		Else
-			Log(job.ErrorMessage)
-		End If
-	Catch
-		Log(LastException.Message)
-	End Try
+' 2. Start a Google Play transactional edit session
+Sub CreateEditDraft
+	Log("Creating a new app edit session...")
+	Dim job As HttpJob
+	job.Initialize("CreateEdit", Me)
+    
+	Dim url As String = $"https://googleapis.com{PackageName}/edits"$
+	job.PostString(url, "")
+	job.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	job.GetRequest.SetContentType("application/json")
+	Wait For (job) JobDone (job As HttpJob)
+	If job.Success Then
+		'assuming that the response is json:
+		Dim root As Map = job.GetString.As(JSON).ToMap
+		Log(root)
+	End If
+		
+	Dim EditId As String = root.Get("id")
+	UploadAAB(EditId)
+End Sub
+
+' 3. Stream the .aab file payload to Google
+Sub UploadAAB (EditId As String)
+	Log("Uploading App Bundle (.aab)...")
+	Dim job As HttpJob
+	job.Initialize("UploadBundle", Me)
+    
+	Dim url As String = $"https://googleapis.com{PackageName}/edits/${EditId}/bundles?uploadType=media"$
+    
+	' Stream the physical binary bundle file directly
+	job.PostFile(url, File.GetFileParent(AabFilePath), File.GetName(AabFilePath))
+	job.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	job.GetRequest.SetContentType("application/octet-stream")
+	Wait For (job) JobDone (job As HttpJob)
+	If job.Success Then
+		'assuming that the response is json:
+		Dim root As Map = job.GetString.As(JSON).ToMap
+		Log(root)
+		
+		' You can extract the VersionCode here if needed
+		Dim EditId As String = job.Tag ' Store/pass your tracking ID
+		CommitChanges(EditId)		
+	End If
+End Sub
+
+' 4. Finalize and push to track
+Sub CommitChanges (EditId As String)
+	Log("Committing release to Google Play...")
+	Dim url As String = $"https://googleapis.com{PackageName}/edits/${EditId}:commit"$
+	Dim job As HttpJob
+	job.Initialize("CommitEdit", Me)
+	job.PostString(url, "")
+	job.GetRequest.SetContentType("application/json")
+	job.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	
+	Wait For (job) JobDone (job As HttpJob)
+	If job.Success Then
+		'assuming that the response is json:
+		Dim root As Map = job.GetString.As(JSON).ToMap
+		Log(root)
+		Log("Success! AAB published successfully.")
+		StopMessageLoop
+		ExitApplication
+	Else
+		Log("Error occurred: " & job.ErrorMessage)
+		StopMessageLoop
+		ExitApplication
+	End If
 	job.Release
-	Return success
 End Sub
+
+'Sub RunUploadProcess (UploadLink As String, FilePath As String, FileName As String)
+'	If Not(File.Exists(FilePath, FileName)) Then
+'		Log("Error: " & FilePath & "\" & FileName & " not found.")
+'		Log("aabtool aborted")
+'		ExitApplication
+'	End If
+'	Upload(UploadLink, FilePath, FileName)
+'End Sub
+
+'Sub Upload (UploadLink As String, FileDirectory As String, FileName As String) As ResumableSub
+'	Log($"Uploading ${FileName}..."$)
+'	Try
+'		Dim success As Boolean
+'		Dim job As HttpJob
+'		job.Initialize
+'		job.PostFile(UploadLink, FileDirectory, FileName)
+'		Wait For (job) JobDone(job As HttpJob)
+'		If job.Success Then
+'			Dim out As OutputStream = File.OpenOutput(FileDirectory, FileName, False)
+'			File.Copy2(job.GetInputStream, out)
+'			out.Close
+'			Log($"${FileName} downloaded"$)
+'			success = True
+'		Else
+'			Log(job.ErrorMessage)
+'		End If
+'	Catch
+'		Log(LastException.Message)
+'	End Try
+'	job.Release
+'	Return success
+'End Sub
