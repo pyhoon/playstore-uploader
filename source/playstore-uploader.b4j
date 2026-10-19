@@ -1,11 +1,12 @@
 ﻿AppType=StandardJava
 Build1=Default,b4j.example
 Group=App
-Library1=jcore
-Library2=jokhttputils2
-Library3=json
+Library1=javaobject
+Library2=jcore
+Library3=jokhttputils2
+Library4=json
 NumberOfFiles=0
-NumberOfLibraries=3
+NumberOfLibraries=4
 NumberOfModules=0
 Version=10.7
 @EndOfDesignText@
@@ -29,10 +30,11 @@ Version=10.7
 '#CustomBuildAction: 5, %COMSPEC%, /c java -jar "C:\tools\aabtool.jar" app-bundle-upload --application-name "Your App Name" --application-package "com.your.package" --app-bundle "%PROJECT%\your_app.aab" --secret-file "C:\tools\google-key.json"
 '#CustomBuildAction: 5, %COMSPEC%, /c gpc releases upload "PROJECT%\your_app.aab" --track internal
 Sub Process_Globals
-    Private ApiKeyJson As String = "C:\tools\google-key.json" ' Path to your Service Account JSON file
+    Private ApiKeyJsonPath As String = "C:\tools\google-key.json" ' Path to your Service Account JSON file
     Private PackageName As String = "com.example.myapp"
     Private AabFilePath As String
     Private AccessToken As String
+    Private TokenExpiryTime As Long
 End Sub
 
 'Sub AppStart (Args() As String)
@@ -67,18 +69,143 @@ Sub AppStart (Args() As String)
     StartMessageLoop
 End Sub
 
-' 1. Authenticate with Google
+' Call this routine as the first step in AppStart
 Sub FetchOAuth2Token
-    ' Note: For production, use GoogleOAuth2 or a JWT generator library.
-    ' This acts as the entry point to communicate with the REST API.
-    Log("Authenticating with Google API...")
+	Log("Parsing Service Account JSON Key...")
+	If File.Exists("", ApiKeyJsonPath) = False Then
+		Log("Error: JSON Key file not found at " & ApiKeyJsonPath)
+		ExitApplication
+	End If
     
-    ' Pro-Tip: To keep your B4J code pure and simple, you can use standard 
-    ' OAuth2 headers or the B4X GoogleOAuth2 class to convert your JSON key to a Bearer token.
-    ' Once you have the AccessToken, proceed to CreateEditDraft.
+	Dim parser As JSONParser
+	parser.Initialize(File.ReadString("", ApiKeyJsonPath))
+	Dim keyMap As Map = parser.NextObject
+	
+	Dim ClientEmail As String = keyMap.Get("client_email")
+	Dim PrivateKeyPem As String = keyMap.Get("private_key")
     
-    CreateEditDraft
+	' 1. Prepare JWT Claims Header and Payload
+	Dim su As StringUtils
+	Dim CurrentTimeSec As Long = DateTime.Now / 1000
+	Dim ExpiryTimeSec As Long = CurrentTimeSec + 3600
+    
+	Dim HeaderMap As Map = CreateMap("alg": "RS256", "typ": "JWT")
+	Dim PayloadMap As Map = CreateMap( _
+        "iss": ClientEmail, _
+        "scope": "https://googleapis.com", _
+        "aud": "https://googleapis.com", _
+        "exp": ExpiryTimeSec, _
+        "iat": CurrentTimeSec _
+    )
+    
+	
+	Dim json As JSONGenerator
+	json.Initialize(HeaderMap)
+	Dim HeaderBase64 As String = su.EncodeBase64(json.ToString.GetBytes("UTF8")).Replace("=", "").Replace("/", "_").Replace("+", "-")
+    
+	json.Initialize(PayloadMap)
+	Dim PayloadBase64 As String = su.EncodeBase64(json.ToString.GetBytes("UTF8")).Replace("=", "").Replace("/", "_").Replace("+", "-")
+    
+	Dim SignatureInput As String = HeaderBase64 & "." & PayloadBase64
+    
+	' 2. Sign the input using RS256 with Native Java mapping
+	Log("Signing JWT Signature assertion...")
+	Dim NativeSigner As JavaObject
+	NativeSigner.InitializeStatic("com.google.auth.SignerHelper") ' Refers to our inline Java class below
+    
+	Dim SignatureBytes() As Byte = NativeSigner.RunMethod("signData", Array(SignatureInput.GetBytes("UTF8"), PrivateKeyPem))
+	Dim SignatureBase64 As String = su.EncodeBase64(SignatureBytes).Replace("=", "").Replace("/", "_").Replace("+", "-")
+    
+	Dim AssertionToken As String = SignatureInput & "." & SignatureBase64
+    
+	' 3. Exchange Signed JWT assertion for a temporary access token via API
+	Log("Exchanging assertion payload for an access token...")
+	Dim job As HttpJob
+	job.Initialize("GetToken", Me)
+	job.PostString("https://googleapis.com", $"grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${AssertionToken}"$)
+	job.GetRequest.SetContentType("application/x-www-form-urlencoded")
+	Wait For (job) JobDone (job As HttpJob)
+	If job.Success Then
+		'assuming that the response is json:
+		Dim root As Map = job.GetString.As(JSON).ToMap
+		Log(root)
+
+        Dim parser As JSONParser
+        parser.Initialize(job.GetString)
+        Dim root As Map = parser.NextObject
+        
+        Select job.JobName
+            Case "GetToken"
+                AccessToken = root.Get("access_token")
+                Log("Authentication Successful! Token acquired.")
+                ' Transition immediately to create the Edit Draft now that we are validated
+                CreateEditDraft
+                
+            Case "CreateEdit"
+                Dim EditId As String = root.Get("id")
+                UploadAAB(EditId)
+                
+            Case "UploadBundle"
+                Dim EditId As String = job.Tag 
+                CommitChanges(EditId)
+                
+            Case "CommitEdit"
+                Log("Success! AAB published successfully to Google Play via B4J.")
+                StopMessageLoop
+                ExitApplication
+        End Select
+    Else
+        Log("Error occurred during job [" & job.JobName & "]: " & job.ErrorMessage)
+        StopMessageLoop
+        ExitApplication
+    End If
+    job.Release
+
 End Sub
+
+#If JAVA
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Base64;
+
+public class SignerHelper {
+    public static byte[] signData(byte[] data, String privateKeyPem) throws Exception {
+        // Strip down PEM framing formatting metadata
+        String privateKeyKey = privateKeyPem
+                .replace("-----BEGIN PRIVATE KEY-----", "")
+                .replaceAll(System.lineSeparator(), "")
+                .replace("-----END PRIVATE KEY-----", "")
+                .replaceAll("\\s", "");
+
+        byte[] encoded = Base64.getDecoder().decode(privateKeyKey);
+        PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(encoded);
+        KeyFactory kf = KeyFactory.getInstance("RSA");
+        PrivateKey privKey = kf.generatePrivate(keySpec);
+
+        Signature privateSignature = Signature.getInstance("SHA256withRSA");
+        privateSignature.initSign(privKey);
+        privateSignature.update(data);
+
+        return privateSignature.sign();
+    }
+}
+#End If
+
+
+' 1. Authenticate with Google
+'Sub FetchOAuth2Token
+'    ' Note: For production, use GoogleOAuth2 or a JWT generator library.
+'    ' This acts as the entry point to communicate with the REST API.
+'    Log("Authenticating with Google API...")
+'    
+'    ' Pro-Tip: To keep your B4J code pure and simple, you can use standard 
+'    ' OAuth2 headers or the B4X GoogleOAuth2 class to convert your JSON key to a Bearer token.
+'    ' Once you have the AccessToken, proceed to CreateEditDraft.
+'    
+'    CreateEditDraft
+'End Sub
 
 ' 2. Start a Google Play transactional edit session
 Sub CreateEditDraft
