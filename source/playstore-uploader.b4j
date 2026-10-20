@@ -12,7 +12,7 @@ Version=10.7
 @EndOfDesignText@
 #Region Project Attributes 
 ' Product: AppBundle Uploader for B4A
-' Version: 0.10
+' Version: 0.11
 ' License: MIT License
 ' Developer: Poon Yip Hoon (Aeric)
 #CommandLineArgs:
@@ -26,287 +26,343 @@ Version=10.7
 #CustomBuildAction: 2, %COMSPEC%, /c copy %PROJECT%\Objects\playstore-uploader.jar %ADDITIONAL%\aabtool.jar
 #End If
 #End Region
-'Put this inside B4A project Main
-'#CustomBuildAction: 5, %COMSPEC%, /c java -jar "C:\tools\aabtool.jar" app-bundle-upload --application-name "Your App Name" --application-package "com.your.package" --app-bundle "%PROJECT%\your_app.aab" --secret-file "C:\tools\google-key.json"
-'#CustomBuildAction: 5, %COMSPEC%, /c gpc releases upload "PROJECT%\your_app.aab" --track internal
 Sub Process_Globals
-    Private ApiKeyJsonPath As String = "C:\tools\google-key.json" ' Path to your Service Account JSON file
-    Private PackageName As String = "com.example.myapp"
-    Private AabFilePath As String
-    Private AccessToken As String
-    Private TokenExpiryTime As Long
-End Sub
+	Private Const TokenUrl As String = "https://oauth2.googleapis.com/token"
+	Private Const ApiBase As String = "https://androidpublisher.googleapis.com/androidpublisher/v3"
+	Private Const UploadBase As String = "https://androidpublisher.googleapis.com/upload/androidpublisher/v3"
+	Private Const AuthScope As String = "https://www.googleapis.com/auth/androidpublisher"
 
-'Sub AppStart (Args() As String)
-'	Log("aabtool (v0.10) started...")
-'	If Args.Length = 0 Then
-'		Log("Error: UploadTool's path not provided")
-'		Log("aabtool ended")
-'		ExitApplication
-'	End If
-'	Dim ScriptPath As String = Args(0)
-'	AabFilePath = "aab_name.aab"
-'	If Args.Length > 1 Then
-'		AabFilePath = Args(1)
-'		Log("AAB_Name=" & AabFilePath)
-'	End If
-'	RunUploadProcess(ScriptPath, "%PROJECT%", AabFilePath)
-'	StartMessageLoop
-'End Sub
+	Private ApiKeyJsonPath As String = "C:\tools\google-key.json"
+	Private PackageName As String = ""
+	Private AabFilePath As String = ""
+	Private ApplicationName As String = ""
+	Private TrackName As String = ""
+	Private ReleaseStatus As String = "completed"
+	Private AccessToken As String
+	Private CurrentEditId As String
+End Sub
 
 Sub AppStart (Args() As String)
-	Log("aabtool (v0.10) started...")
-    If Args.Length < 2 Then
-        Log("Usage: java -jar aabtool.jar <path_to_aab> <package_name>")
-        ExitApplication
-    End If
-    
-    AabFilePath = Args(0)
-    PackageName = Args(1)
-    
-    ' Start the flow by fetching an OAuth token
-    FetchOAuth2Token
-    StartMessageLoop
-End Sub
-
-' Call this routine as the first step in AppStart
-Sub FetchOAuth2Token
-	Log("Parsing Service Account JSON Key...")
+	Log("aabtool (v0.11) started...")
+	If ParseArgs(Args) = False Then
+		LogUsage
+		ExitApplication
+		Return
+	End If
+	If File.Exists("", AabFilePath) = False Then
+		Log("Error: App Bundle not found: " & AabFilePath)
+		ExitApplication
+		Return
+	End If
 	If File.Exists("", ApiKeyJsonPath) = False Then
-		Log("Error: JSON Key file not found at " & ApiKeyJsonPath)
+		Log("Error: Service account JSON not found: " & ApiKeyJsonPath)
 		ExitApplication
+		Return
 	End If
-    
-	Dim parser As JSONParser
-	parser.Initialize(File.ReadString("", ApiKeyJsonPath))
-	Dim keyMap As Map = parser.NextObject
-	
-	Dim ClientEmail As String = keyMap.Get("client_email")
-	Dim PrivateKeyPem As String = keyMap.Get("private_key")
-    
-	' 1. Prepare JWT Claims Header and Payload
-	Dim su As StringUtils
-	Dim CurrentTimeSec As Long = DateTime.Now / 1000
-	Dim ExpiryTimeSec As Long = CurrentTimeSec + 3600
-    
-	Dim HeaderMap As Map = CreateMap("alg": "RS256", "typ": "JWT")
-	Dim PayloadMap As Map = CreateMap( _
-        "iss": ClientEmail, _
-        "scope": "https://googleapis.com", _
-        "aud": "https://googleapis.com", _
-        "exp": ExpiryTimeSec, _
-        "iat": CurrentTimeSec _
-    )
-    
-	
-	Dim json As JSONGenerator
-	json.Initialize(HeaderMap)
-	Dim HeaderBase64 As String = su.EncodeBase64(json.ToString.GetBytes("UTF8")).Replace("=", "").Replace("/", "_").Replace("+", "-")
-    
-	json.Initialize(PayloadMap)
-	Dim PayloadBase64 As String = su.EncodeBase64(json.ToString.GetBytes("UTF8")).Replace("=", "").Replace("/", "_").Replace("+", "-")
-    
-	Dim SignatureInput As String = HeaderBase64 & "." & PayloadBase64
-    
-	' 2. Sign the input using RS256 with Native Java mapping
-	Log("Signing JWT Signature assertion...")
-	Dim NativeSigner As JavaObject
-	NativeSigner.InitializeStatic("com.google.auth.SignerHelper") ' Refers to our inline Java class below
-    
-	Dim SignatureBytes() As Byte = NativeSigner.RunMethod("signData", Array(SignatureInput.GetBytes("UTF8"), PrivateKeyPem))
-	Dim SignatureBase64 As String = su.EncodeBase64(SignatureBytes).Replace("=", "").Replace("/", "_").Replace("+", "-")
-    
-	Dim AssertionToken As String = SignatureInput & "." & SignatureBase64
-    
-	' 3. Exchange Signed JWT assertion for a temporary access token via API
-	Log("Exchanging assertion payload for an access token...")
-	Dim job As HttpJob
-	job.Initialize("GetToken", Me)
-	job.PostString("https://googleapis.com", $"grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${AssertionToken}"$)
-	job.GetRequest.SetContentType("application/x-www-form-urlencoded")
-	Wait For (job) JobDone (job As HttpJob)
-	If job.Success Then
-		'assuming that the response is json:
-		Dim root As Map = job.GetString.As(JSON).ToMap
-		Log(root)
-
-        Dim parser As JSONParser
-        parser.Initialize(job.GetString)
-        Dim root As Map = parser.NextObject
-        
-        Select job.JobName
-            Case "GetToken"
-                AccessToken = root.Get("access_token")
-                Log("Authentication Successful! Token acquired.")
-                ' Transition immediately to create the Edit Draft now that we are validated
-                CreateEditDraft
-                
-            Case "CreateEdit"
-                Dim EditId As String = root.Get("id")
-                UploadAAB(EditId)
-                
-            Case "UploadBundle"
-                Dim EditId As String = job.Tag 
-                CommitChanges(EditId)
-                
-            Case "CommitEdit"
-                Log("Success! AAB published successfully to Google Play via B4J.")
-                StopMessageLoop
-                ExitApplication
-        End Select
-    Else
-        Log("Error occurred during job [" & job.JobName & "]: " & job.ErrorMessage)
-        StopMessageLoop
-        ExitApplication
-    End If
-    job.Release
-
+	If ApplicationName <> "" Then Log("Application: " & ApplicationName)
+	RunUpload
+	StartMessageLoop
 End Sub
 
-#If JAVA
-import java.security.KeyFactory;
-import java.security.PrivateKey;
-import java.security.Signature;
-import java.security.spec.PKCS8EncodedKeySpec;
-import java.util.Base64;
-
-public class SignerHelper {
-    public static byte[] signData(byte[] data, String privateKeyPem) throws Exception {
-        // Strip down PEM framing formatting metadata
-        String privateKeyKey = privateKeyPem
-                .replace("-----BEGIN PRIVATE KEY-----", "")
-                .replaceAll(System.lineSeparator(), "")
-                .replace("-----END PRIVATE KEY-----", "")
-                .replaceAll("\\s", "");
-
-        byte[] encoded = Base64.getDecoder().decode(privateKeyKey);
-        PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(encoded);
-        KeyFactory kf = KeyFactory.getInstance("RSA");
-        PrivateKey privKey = kf.generatePrivate(keySpec);
-
-        Signature privateSignature = Signature.getInstance("SHA256withRSA");
-        privateSignature.initSign(privKey);
-        privateSignature.update(data);
-
-        return privateSignature.sign();
-    }
-}
-#End If
-
-
-' 1. Authenticate with Google
-'Sub FetchOAuth2Token
-'    ' Note: For production, use GoogleOAuth2 or a JWT generator library.
-'    ' This acts as the entry point to communicate with the REST API.
-'    Log("Authenticating with Google API...")
-'    
-'    ' Pro-Tip: To keep your B4J code pure and simple, you can use standard 
-'    ' OAuth2 headers or the B4X GoogleOAuth2 class to convert your JSON key to a Bearer token.
-'    ' Once you have the AccessToken, proceed to CreateEditDraft.
-'    
-'    CreateEditDraft
-'End Sub
-
-' 2. Start a Google Play transactional edit session
-Sub CreateEditDraft
-	Log("Creating a new app edit session...")
-	Dim job As HttpJob
-	job.Initialize("CreateEdit", Me)
-    
-	Dim url As String = $"https://googleapis.com{PackageName}/edits"$
-	job.PostString(url, "")
-	job.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
-	job.GetRequest.SetContentType("application/json")
-	Wait For (job) JobDone (job As HttpJob)
-	If job.Success Then
-		'assuming that the response is json:
-		Dim root As Map = job.GetString.As(JSON).ToMap
-		Log(root)
+Sub ParseArgs (Args() As String) As Boolean
+	Dim i As Int = 0
+	Do While i < Args.Length
+		Dim Arg As String = Args(i)
+		Dim LowerArg As String = Arg.ToLowerCase
+		Select LowerArg
+			Case "app-bundle-upload", "--app-bundle-upload"
+				Log("Command: app-bundle-upload")
+			Case "--app-bundle", "--aab"
+				i = i + 1
+				If i >= Args.Length Then Return False
+				AabFilePath = Args(i)
+			Case "--application-package", "--package"
+				i = i + 1
+				If i >= Args.Length Then Return False
+				PackageName = Args(i)
+			Case "--application-name"
+				i = i + 1
+				If i >= Args.Length Then Return False
+				ApplicationName = Args(i)
+			Case "--secret-file", "--key"
+				i = i + 1
+				If i >= Args.Length Then Return False
+				ApiKeyJsonPath = Args(i)
+			Case "--track"
+				i = i + 1
+				If i >= Args.Length Then Return False
+				TrackName = Args(i)
+			Case "--status"
+				i = i + 1
+				If i >= Args.Length Then Return False
+				ReleaseStatus = Args(i)
+			Case Else
+				If LowerArg.StartsWith("--") Then
+					Log("Error: Unknown option: " & Arg)
+					Return False
+				End If
+				If AabFilePath = "" Then
+					AabFilePath = Arg
+				Else If PackageName = "" Then
+					PackageName = Arg
+				Else If File.Exists("", Arg) Then
+					ApiKeyJsonPath = Arg
+				Else
+					Log("Error: Unexpected argument: " & Arg)
+					Return False
+				End If
+		End Select
+		i = i + 1
+	Loop
+	If AabFilePath = "" Or PackageName = "" Then
+		Log("Error: Both the App Bundle path and the application package are required.")
+		Return False
 	End If
-		
-	Dim EditId As String = root.Get("id")
-	UploadAAB(EditId)
+	Return True
 End Sub
 
-' 3. Stream the .aab file payload to Google
-Sub UploadAAB (EditId As String)
-	Log("Uploading App Bundle (.aab)...")
-	Dim job As HttpJob
-	job.Initialize("UploadBundle", Me)
-    
-	Dim url As String = $"https://googleapis.com{PackageName}/edits/${EditId}/bundles?uploadType=media"$
-    
-	' Stream the physical binary bundle file directly
-	job.PostFile(url, File.GetFileParent(AabFilePath), File.GetName(AabFilePath))
-	job.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
-	job.GetRequest.SetContentType("application/octet-stream")
-	Wait For (job) JobDone (job As HttpJob)
-	If job.Success Then
-		'assuming that the response is json:
-		Dim root As Map = job.GetString.As(JSON).ToMap
-		Log(root)
-		
-		' You can extract the VersionCode here if needed
-		Dim EditId As String = job.Tag ' Store/pass your tracking ID
-		CommitChanges(EditId)		
-	End If
+Sub LogUsage
+	Log("Usage:")
+	Log("  java -jar aabtool.jar --app-bundle <file.aab> --application-package <package> [--secret-file <key.json>] [--track <track>] [--status <status>]")
+	Log("  java -jar aabtool.jar <file.aab> <package> [key.json]")
+	Log("Options:")
+	Log("  --track    Optional track name, for example: internal, alpha, beta, production.")
+	Log("  --status   Release status for the track. Default: completed.")
 End Sub
 
-' 4. Finalize and push to track
-Sub CommitChanges (EditId As String)
-	Log("Committing release to Google Play...")
-	Dim url As String = $"https://googleapis.com{PackageName}/edits/${EditId}:commit"$
-	Dim job As HttpJob
-	job.Initialize("CommitEdit", Me)
-	job.PostString(url, "")
-	job.GetRequest.SetContentType("application/json")
-	job.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
-	
-	Wait For (job) JobDone (job As HttpJob)
-	If job.Success Then
-		'assuming that the response is json:
-		Dim root As Map = job.GetString.As(JSON).ToMap
-		Log(root)
-		Log("Success! AAB published successfully.")
-		StopMessageLoop
-		ExitApplication
+Sub RunUpload As ResumableSub
+	Log("Package: " & PackageName)
+	Log("Bundle: " & AabFilePath)
+	If TrackName <> "" Then Log("Track: " & TrackName & " (" & ReleaseStatus & ")")
+
+	Dim Assertion As String = BuildJwtAssertion
+	If Assertion = "" Then
+		Log("Error: Failed to build the OAuth2 assertion.")
+		Finish(False)
+		Return False
+	End If
+
+	Log("Requesting access token...")
+	Dim TokenJob As HttpJob
+	TokenJob.Initialize("GetToken", Me)
+	TokenJob.PostString(TokenUrl, "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=" & Assertion)
+	TokenJob.GetRequest.SetContentType("application/x-www-form-urlencoded")
+	Wait For (TokenJob) JobDone (TokenJob As HttpJob)
+	If TokenJob.Success = False Then
+		LogJobError(TokenJob, "token exchange")
+		TokenJob.Release
+		Finish(False)
+		Return False
+	End If
+	Dim TokenMap As Map = ParseJson(TokenJob.GetString)
+	TokenJob.Release
+	AccessToken = MapGet(TokenMap, "access_token")
+	If AccessToken = "" Then
+		Log("Error: The token response did not include an access_token.")
+		Finish(False)
+		Return False
+	End If
+	Log("Access token acquired.")
+
+	Log("Creating edit session...")
+	Dim EditJob As HttpJob
+	EditJob.Initialize("CreateEdit", Me)
+	EditJob.PostString(ApiBase & "/applications/" & PackageName & "/edits", "{}")
+	EditJob.GetRequest.SetContentType("application/json")
+	EditJob.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	Wait For (EditJob) JobDone (EditJob As HttpJob)
+	If EditJob.Success = False Then
+		LogJobError(EditJob, "create edit")
+		EditJob.Release
+		Finish(False)
+		Return False
+	End If
+	Dim EditMap As Map = ParseJson(EditJob.GetString)
+	EditJob.Release
+	CurrentEditId = MapGet(EditMap, "id")
+	If CurrentEditId = "" Then
+		Log("Error: The edit response did not include an id.")
+		Finish(False)
+		Return False
+	End If
+	Log("Edit session: " & CurrentEditId)
+
+	Log("Uploading App Bundle...")
+	Dim UploadJob As HttpJob
+	UploadJob.Initialize("UploadBundle", Me)
+	Dim UploadUrl As String = UploadBase & "/applications/" & PackageName & "/edits/" & CurrentEditId & "/bundles?uploadType=media"
+	UploadJob.PostFile(UploadUrl, File.GetFileParent(AabFilePath), File.GetName(AabFilePath))
+	UploadJob.GetRequest.SetContentType("application/octet-stream")
+	UploadJob.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	Wait For (UploadJob) JobDone (UploadJob As HttpJob)
+	If UploadJob.Success = False Then
+		LogJobError(UploadJob, "bundle upload")
+		UploadJob.Release
+		Wait For (AbortEdit) Complete (Ignored As Boolean)
+		Finish(False)
+		Return False
+	End If
+	Dim UploadMap As Map = ParseJson(UploadJob.GetString)
+	UploadJob.Release
+	Dim VersionCode As Long = 0
+	If UploadMap.ContainsKey("versionCode") Then VersionCode = UploadMap.Get("versionCode")
+	If VersionCode <= 0 Then
+		Log("Error: The upload response did not include a versionCode.")
+		Wait For (AbortEdit) Complete (Ignored As Boolean)
+		Finish(False)
+		Return False
+	End If
+	Log("Uploaded version code: " & VersionCode)
+
+	If TrackName <> "" Then
+		Log("Assigning version code " & VersionCode & " to track " & TrackName & "...")
+		Dim ReleaseMap As Map = CreateMap("status": ReleaseStatus, "versionCodes": Array(VersionCode))
+		Dim TrackBody As Map = CreateMap("releases": Array(ReleaseMap))
+		Dim TrackJson As JSONGenerator
+		TrackJson.Initialize(TrackBody)
+		Dim TrackJob As HttpJob
+		TrackJob.Initialize("UpdateTrack", Me)
+		TrackJob.PutString(ApiBase & "/applications/" & PackageName & "/edits/" & CurrentEditId & "/tracks/" & TrackName, TrackJson.ToString)
+		TrackJob.GetRequest.SetContentType("application/json")
+		TrackJob.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+		Wait For (TrackJob) JobDone (TrackJob As HttpJob)
+		If TrackJob.Success = False Then
+			LogJobError(TrackJob, "track update")
+			TrackJob.Release
+			Wait For (AbortEdit) Complete (Ignored As Boolean)
+			Finish(False)
+			Return False
+		End If
+		TrackJob.Release
+	End If
+
+	Log("Committing edit...")
+	Dim CommitJob As HttpJob
+	CommitJob.Initialize("CommitEdit", Me)
+	CommitJob.PostString(ApiBase & "/applications/" & PackageName & "/edits/" & CurrentEditId & ":commit", "{}")
+	CommitJob.GetRequest.SetContentType("application/json")
+	CommitJob.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	Wait For (CommitJob) JobDone (CommitJob As HttpJob)
+	If CommitJob.Success = False Then
+		LogJobError(CommitJob, "commit edit")
+		CommitJob.Release
+		Wait For (AbortEdit) Complete (Ignored As Boolean)
+		Finish(False)
+		Return False
+	End If
+	CommitJob.Release
+	CurrentEditId = ""
+	Finish(True)
+	Return True
+End Sub
+
+Sub AbortEdit As ResumableSub
+	If CurrentEditId = "" Then Return False
+	Log("Aborting edit " & CurrentEditId & "...")
+	Dim AbortJob As HttpJob
+	AbortJob.Initialize("AbortEdit", Me)
+	AbortJob.Delete(ApiBase & "/applications/" & PackageName & "/edits/" & CurrentEditId)
+	AbortJob.GetRequest.SetHeader("Authorization", "Bearer " & AccessToken)
+	Wait For (AbortJob) JobDone (AbortJob As HttpJob)
+	If AbortJob.Success = False Then LogJobError(AbortJob, "abort edit")
+	AbortJob.Release
+	CurrentEditId = ""
+	Return True
+End Sub
+
+Sub Finish (Success As Boolean)
+	If Success Then
+		Log("Done: App Bundle uploaded and edit committed.")
 	Else
-		Log("Error occurred: " & job.ErrorMessage)
-		StopMessageLoop
-		ExitApplication
+		Log("Done: upload failed.")
 	End If
-	job.Release
+	ExitApplication
 End Sub
 
-'Sub RunUploadProcess (UploadLink As String, FilePath As String, FileName As String)
-'	If Not(File.Exists(FilePath, FileName)) Then
-'		Log("Error: " & FilePath & "\" & FileName & " not found.")
-'		Log("aabtool aborted")
-'		ExitApplication
-'	End If
-'	Upload(UploadLink, FilePath, FileName)
-'End Sub
+Sub BuildJwtAssertion As String
+	Try
+		Dim Parser As JSONParser
+		Parser.Initialize(File.ReadString("", ApiKeyJsonPath))
+		Dim KeyMap As Map = Parser.NextObject
+		Dim ClientEmail As String = MapGet(KeyMap, "client_email")
+		Dim PrivateKeyPem As String = MapGet(KeyMap, "private_key")
+		If ClientEmail = "" Or PrivateKeyPem = "" Then
+			Log("Error: Service account JSON must contain client_email and private_key.")
+			Return ""
+		End If
 
-'Sub Upload (UploadLink As String, FileDirectory As String, FileName As String) As ResumableSub
-'	Log($"Uploading ${FileName}..."$)
-'	Try
-'		Dim success As Boolean
-'		Dim job As HttpJob
-'		job.Initialize
-'		job.PostFile(UploadLink, FileDirectory, FileName)
-'		Wait For (job) JobDone(job As HttpJob)
-'		If job.Success Then
-'			Dim out As OutputStream = File.OpenOutput(FileDirectory, FileName, False)
-'			File.Copy2(job.GetInputStream, out)
-'			out.Close
-'			Log($"${FileName} downloaded"$)
-'			success = True
-'		Else
-'			Log(job.ErrorMessage)
-'		End If
-'	Catch
-'		Log(LastException.Message)
-'	End Try
-'	job.Release
-'	Return success
-'End Sub
+		Dim NowSeconds As Long = DateTime.Now / 1000
+		Dim HeaderJson As JSONGenerator
+		HeaderJson.Initialize(CreateMap("alg": "RS256", "typ": "JWT"))
+		Dim PayloadJson As JSONGenerator
+		PayloadJson.Initialize(CreateMap( _
+			"iss": ClientEmail, _
+			"scope": AuthScope, _
+			"aud": TokenUrl, _
+			"iat": NowSeconds, _
+			"exp": NowSeconds + 3600))
+
+		Dim SigningInput As String = Base64Url(HeaderJson.ToString.GetBytes("UTF8")) & "." & Base64Url(PayloadJson.ToString.GetBytes("UTF8"))
+		Dim Signature() As Byte = SignData(SigningInput.GetBytes("UTF8"), PrivateKeyPem)
+		If Signature.Length = 0 Then Return ""
+		Return SigningInput & "." & Base64Url(Signature)
+	Catch
+		Log("Error: Failed to build JWT: " & LastException.Message)
+		Return ""
+	End Try
+End Sub
+
+Sub SignData (Data() As Byte, PrivateKeyPem As String) As Byte()
+	Dim su As StringUtils
+	Dim Pem As String = PrivateKeyPem _
+		.Replace("-----BEGIN PRIVATE KEY-----", "") _
+		.Replace("-----END PRIVATE KEY-----", "") _
+		.Replace(Chr(13), "") _
+		.Replace(Chr(10), "") _
+		.Replace(" ", "") _
+		.Replace(Chr(9), "")
+	Dim KeyBytes() As Byte = su.DecodeBase64(Pem)
+
+	Dim Spec As JavaObject
+	Spec.InitializeNewInstance("java.security.spec.PKCS8EncodedKeySpec", Array(KeyBytes))
+
+	Dim KeyFactoryClass As JavaObject
+	KeyFactoryClass.InitializeStatic("java.security.KeyFactory")
+	Dim KeyFactory As JavaObject = KeyFactoryClass.RunMethod("getInstance", Array("RSA"))
+	Dim PrivateKey As Object = KeyFactory.RunMethod("generatePrivate", Array(Spec))
+
+	Dim SignatureClass As JavaObject
+	SignatureClass.InitializeStatic("java.security.Signature")
+	Dim Signer As JavaObject = SignatureClass.RunMethod("getInstance", Array("SHA256withRSA"))
+	Signer.RunMethod("initSign", Array(PrivateKey))
+	Signer.RunMethod("update", Array(Data))
+	Dim Result() As Byte = Signer.RunMethod("sign", Null)
+	Return Result
+End Sub
+
+Sub Base64Url (Data() As Byte) As String
+	Dim su As StringUtils
+	Return su.EncodeBase64(Data).Replace("+", "-").Replace("/", "_").Replace("=", "")
+End Sub
+
+Sub ParseJson (Text As String) As Map
+	Try
+		Dim Parser As JSONParser
+		Parser.Initialize(Text)
+		Return Parser.NextObject
+	Catch
+		Log("Error: Could not parse JSON response: " & LastException.Message)
+		Return CreateMap()
+	End Try
+End Sub
+
+Sub MapGet (Values As Map, Key As String) As String
+	If Values = Null Or Values.ContainsKey(Key) = False Then Return ""
+	Dim Value As Object = Values.Get(Key)
+	If Value = Null Then Return ""
+	Return "" & Value
+End Sub
+
+Sub LogJobError (Job As HttpJob, Stage As String)
+	Log("Error during " & Stage & ": " & Job.ErrorMessage)
+End Sub
