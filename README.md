@@ -143,7 +143,7 @@ Argument and file validation errors exit earlier with an `Error: ...` message.
 
 ## Use after a B4A build
 
-B4A supports an `after packager` custom build action, which runs after the AAB is signed. Add it to the main module to upload straight from an IDE build:
+B4A supports an `after packager` custom build action, which runs after the AAB is signed. Add it to the main module to upload straight from **Project > Build App Bundle**:
 
 ```b4x
 #If RELEASE
@@ -154,8 +154,37 @@ B4A supports an `after packager` custom build action, which runs after the AAB i
 B4A names the bundle after the project (normally `<project name>.aab`) in the `Objects` folder, so replace `MyApp.aab` with the file shown in the build log. The action's working directory is `Objects`, and `%JAVABIN%` is the JDK configured in B4A.
 
 - Do not use step `5`; it runs after the APK is installed on a device.
-- The action blocks the IDE until the upload finishes. For slow uploads, run `aabtool` from a batch script after the build instead.
-- Custom build actions are not executed by command-line builds. For CI, invoke the tool explicitly after the build:
+- The action blocks the IDE until the upload finishes.
+
+### One-click build and upload
+
+[build-upload.bat](build-upload.bat) builds the AAB with `B4ABuilder -Task=BuildBundle` and then uploads it with `aabtool`. Copy it into the B4A project folder (next to the `.b4a` file) and edit the paths, package name, track, and `OBFUSCATE` setting at the top.
+
+Run it from a terminal, or add this macro to the `Main` module to run it from the IDE title bar:
+
+```b4x
+#Macro: Title, Build AAB and Upload, ide://run?File=%COMSPEC%&Args=/c&Args=..\build-upload.bat&NoTimeout=True
+```
+
+The script writes the build and upload log to `build-upload.log` in the project folder and opens it on failure. It treats a missing success marker as a failure because `aabtool` exits `0` even when the upload fails.
+
+To build the bundle without uploading:
+
+```b4x
+#Macro: Title, Build AAB, ide://run?File=%B4X%\B4ABuilder.exe&Args=-Task%3DBuildBundle&Args=-BaseFolder%3D..&NoTimeout=True
+```
+
+Obfuscated build:
+
+```b4x
+#Macro: Title, Build AAB (obfuscated), ide://run?File=%B4X%\B4ABuilder.exe&Args=-Task%3DBuildBundle&Args=-BaseFolder%3D..&Args=-Obfuscate%3DTrue&NoTimeout=True
+```
+
+For an obfuscated one-click build and upload, set `OBFUSCATE=True` at the top of `build-upload.bat`. `#Macro` requires B4A 13.3 or newer.
+
+### Build from a script or CI
+
+Custom build actions are not executed by command-line builds, so build and upload explicitly:
 
 ```powershell
 # Build the AAB with B4A first, then upload it.
@@ -211,6 +240,7 @@ if (($output -join "`n") -notmatch "Done: App Bundle uploaded and edit committed
 ## Project layout
 
 ```text
+build-upload.bat                Template B4A build/upload script
 source/playstore-uploader.b4j   B4J source
 source/Objects/                 Build output
 source/AutoBackups/             B4J automatic backups (ignored by git)

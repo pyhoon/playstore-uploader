@@ -1,6 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
+*.bat text eol=crlf
+
 *.b4j linguist-language=B4X
 *.bas linguist-language=B4X
 *.b4j linguist-detectable=true
